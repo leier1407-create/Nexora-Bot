@@ -9,6 +9,7 @@ import discord
 import requests
 from dotenv import load_dotenv
 from flask import Flask, abort, redirect, render_template_string, request, session, url_for
+from openai import OpenAI
 
 load_dotenv()
 
@@ -26,6 +27,8 @@ DISCORD_REDIRECT_URI = os.getenv(
 )
 DATABASE_PATH = os.getenv("DATABASE_PATH", "warnings.db")
 DISCORD_API = "https://discord.com/api/v10"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None 
 
 discord_bot = None
 
