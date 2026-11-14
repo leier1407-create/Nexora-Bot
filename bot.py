@@ -5,6 +5,8 @@ import aiosqlite
 import discord
 from discord import app_commands
 from discord.ext import commands
+import threading
+from dashboard import app
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 LOG_CHANNEL_ID = os.getenv("MOD_LOG_CHANNEL_ID")
@@ -406,4 +408,9 @@ async def on_app_command_error(
     else:
         await interaction.response.send_message(message, ephemeral=True)
 
+def run_dashboard():
+    port = int(os.environ.get("SERVER_PORT", "25386"))
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+threading.Thread(target=run_dashboard, daemon=True).start()
 bot.run(TOKEN)
