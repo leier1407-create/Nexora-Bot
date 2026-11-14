@@ -273,7 +273,7 @@ def generate_server_template(description):
     )
 
     response = gemini_client.models.generate_content(
-        model="gemini-3.1-flash",
+        model="gemini-3.8-flash",
         contents=prompt,
         config={
             "response_mime_type": "application/json",
