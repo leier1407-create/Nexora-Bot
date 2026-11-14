@@ -9,7 +9,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from dashboard import app
+from dashboard import app, configure_bot
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +27,7 @@ intents.members = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+configure_bot(bot)
 
 async def initialize_database():
     async with aiosqlite.connect(DATABASE_PATH) as db:
