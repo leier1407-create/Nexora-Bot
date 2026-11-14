@@ -65,21 +65,35 @@ async def on_ready():
     except discord.DiscordException as error:
         print(f"Fehler beim Synchronisieren der Befehle: {error}")
 
-def bot_can_moderate(interaction: discord.Interaction) -> bool:
-    return (
-        interaction.guild is not None
-        and interaction.guild.me is not None
-        and interaction.guild.me.guild_permissions.moderate_members
-    )
-
-def target_is_higher(
-    interaction: discord.Interaction,
-    member: discord.Member,
-) -> bool:
+def target_is_higher(interaction: discord.Interaction, member: discord.Member) -> bool:
     return (
         member.top_role >= interaction.user.top_role
         and interaction.user.id != interaction.guild.owner_id
     )
+
+@bot.tree.command(name="warn", description="Verwarnt ein Mitglied.")
+@app_commands.describe(mitglied="Mitglied, das verwarnt werden soll", grund="Grund für die Verwarnung")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def warn(interaction: discord.Interaction, mitglied: discord.Member, grund: str):
+    if mitglied.id == interaction.user.id:
+        await interaction.response.send_message("Du kannst dich nicht selbst verwarnen.", ephemeral=True)
+        return
+    if mitglied.id == interaction.guild.owner_id:
+        await interaction.response.send_message("Der Serverinhaber kann nicht verwarnt werden.", ephemeral=True)
+        return
+    if target_is_higher(interaction, mitglied):
+        await interaction.response.send_message("Die Rolle dieses Mitglieds ist gleich hoch oder höher als deine.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(f"{mitglied.mention} wurde verwarnt. Grund: {grund}")
+    await log_action(interaction.guild, "Verwarnung", interaction.user, mitglied, grund)
+
+    try:
+        await mitglied.send(
+            f"Du wurdest auf **{interaction.guild.name}** verwarnt.\nGrund: {grund}"
+        )
+    except discord.Forbidden:
+        pass
 
 @bot.tree.command(name="timeout", description="Gibt einem Mitglied eine Auszeit.")
 @app_commands.describe(
@@ -103,7 +117,7 @@ async def timeout(
     if target_is_higher(interaction, mitglied):
         await interaction.response.send_message("Die Rolle dieses Mitglieds ist gleich hoch oder höher als deine.", ephemeral=True)
         return
-    if not bot_can_moderate(interaction):
+    if not interaction.guild.me.guild_permissions.moderate_members:
         await interaction.response.send_message("Nexora braucht die Berechtigung „Mitglieder moderieren“.", ephemeral=True)
         return
 
@@ -112,17 +126,10 @@ async def timeout(
         await interaction.response.send_message(
             f"{mitglied.mention} hat einen Timeout für {minuten} Minuten erhalten. Grund: {grund}"
         )
-        await log_action(
-            interaction.guild,
-            "Timeout",
-            interaction.user,
-            mitglied,
-            grund,
-            f"{minuten} Minuten",
-        )
+        await log_action(interaction.guild, "Timeout", interaction.user, mitglied, grund, f"{minuten} Minuten")
     except discord.Forbidden:
         await interaction.response.send_message(
-            "Nexora kann dieses Mitglied nicht timeouten. Prüfe die Bot-Berechtigungen und die Rollenreihenfolge.",
+            "Nexora kann dieses Mitglied nicht timeouten. Prüfe die Berechtigungen und Rollenreihenfolge.",
             ephemeral=True,
         )
 
@@ -149,7 +156,7 @@ async def kick(interaction: discord.Interaction, mitglied: discord.Member, grund
         await log_action(interaction.guild, "Kick", interaction.user, mitglied, grund)
     except discord.Forbidden:
         await interaction.response.send_message(
-            "Nexora kann dieses Mitglied nicht kicken. Prüfe die Bot-Berechtigungen und die Rollenreihenfolge.",
+            "Nexora kann dieses Mitglied nicht kicken. Prüfe die Berechtigungen und Rollenreihenfolge.",
             ephemeral=True,
         )
 
@@ -176,7 +183,7 @@ async def ban(interaction: discord.Interaction, mitglied: discord.Member, grund:
         await log_action(interaction.guild, "Ban", interaction.user, mitglied, grund)
     except discord.Forbidden:
         await interaction.response.send_message(
-            "Nexora kann dieses Mitglied nicht bannen. Prüfe die Bot-Berechtigungen und die Rollenreihenfolge.",
+            "Nexora kann dieses Mitglied nicht bannen. Prüfe die Berechtigungen und Rollenreihenfolge.",
             ephemeral=True,
         )
 
