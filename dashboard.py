@@ -16,7 +16,7 @@ from flask import (
     session,
     url_for,
 )
-from openai import OpenAI
+from google import genai
 
 load_dotenv()
 
