@@ -204,7 +204,7 @@ async def warnungen(interaction: discord.Interaction, mitglied: discord.Member):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="warnung_loeschen", description="Löscht eine gespeicherte Verwarnung anhand ihrer ID.")
+@bot.tree.command(name="warnung_löschen", description="Löscht eine gespeicherte Verwarnung anhand ihrer ID.")
 @app_commands.describe(warnungs_id="ID der zu löschenden Verwarnung")
 @app_commands.checks.has_permissions(moderate_members=True)
 async def warnung_loeschen(interaction: discord.Interaction, warnungs_id: int):
