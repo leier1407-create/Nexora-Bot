@@ -3,7 +3,9 @@ from urllib.parse import urlencode
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, redirect, render_template_string, session, url_for
+
+from flask import Flask, redirect, render_template_string, request, session, url_for
+
 
 load_dotenv()
 
