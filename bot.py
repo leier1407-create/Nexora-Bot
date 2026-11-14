@@ -6,6 +6,7 @@ from discord import app_commands
 from discord.ext import commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+LOG_CHANNEL_ID = os.getenv("MOD_LOG_CHANNEL_ID")
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN fehlt in den Umgebungsvariablen des Hostings.")
@@ -14,6 +15,46 @@ intents = discord.Intents.default()
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+async def log_action(
+    guild: discord.Guild,
+    action: str,
+    moderator: discord.abc.User,
+    member: discord.abc.User,
+    reason: str,
+    duration: str | None = None,
+) -> None:
+    if not LOG_CHANNEL_ID:
+        return
+
+    try:
+        channel_id = int(LOG_CHANNEL_ID)
+    except ValueError:
+        print("MOD_LOG_CHANNEL_ID muss eine gültige Kanal-ID sein.")
+        return
+
+    channel = guild.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        print(f"Moderations-Logkanal {channel_id} wurde auf diesem Server nicht gefunden.")
+        return
+
+    embed = discord.Embed(
+        title=f"Moderation: {action}",
+        color=discord.Color.orange(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Mitglied", value=f"{member.mention} (`{member.id}`)", inline=False)
+    embed.add_field(name="Moderator", value=f"{moderator.mention} (`{moderator.id}`)", inline=False)
+    embed.add_field(name="Grund", value=reason[:1024], inline=False)
+    if duration:
+        embed.add_field(name="Dauer", value=duration, inline=True)
+
+    try:
+        await channel.send(embed=embed)
+    except discord.Forbidden:
+        print("Nexora darf im Moderations-Logkanal keine Nachrichten oder Embeds senden.")
+    except discord.HTTPException as error:
+        print(f"Moderationsprotokoll konnte nicht gesendet werden: {error}")
 
 @bot.event
 async def on_ready():
@@ -25,12 +66,25 @@ async def on_ready():
         print(f"Fehler beim Synchronisieren der Befehle: {error}")
 
 def bot_can_moderate(interaction: discord.Interaction) -> bool:
-    return interaction.guild is not None and interaction.guild.me.guild_permissions.moderate_members
+    return (
+        interaction.guild is not None
+        and interaction.guild.me is not None
+        and interaction.guild.me.guild_permissions.moderate_members
+    )
+
+def target_is_higher(
+    interaction: discord.Interaction,
+    member: discord.Member,
+) -> bool:
+    return (
+        member.top_role >= interaction.user.top_role
+        and interaction.user.id != interaction.guild.owner_id
+    )
 
 @bot.tree.command(name="timeout", description="Gibt einem Mitglied eine Auszeit.")
 @app_commands.describe(
     mitglied="Mitglied, das eine Auszeit erhalten soll",
-    minuten="Dauer der Auszeit in Minuten, maximal 40320",
+    minuten="Dauer in Minuten, maximal 40320",
     grund="Grund für die Auszeit",
 )
 @app_commands.checks.has_permissions(moderate_members=True)
@@ -46,7 +100,7 @@ async def timeout(
     if mitglied.id == interaction.guild.owner_id:
         await interaction.response.send_message("Der Serverinhaber kann nicht timeoutet werden.", ephemeral=True)
         return
-    if mitglied.top_role >= interaction.user.top_role and interaction.user.id != interaction.guild.owner_id:
+    if target_is_higher(interaction, mitglied):
         await interaction.response.send_message("Die Rolle dieses Mitglieds ist gleich hoch oder höher als deine.", ephemeral=True)
         return
     if not bot_can_moderate(interaction):
@@ -57,6 +111,14 @@ async def timeout(
         await mitglied.timeout(timedelta(minutes=minuten), reason=grund)
         await interaction.response.send_message(
             f"{mitglied.mention} hat einen Timeout für {minuten} Minuten erhalten. Grund: {grund}"
+        )
+        await log_action(
+            interaction.guild,
+            "Timeout",
+            interaction.user,
+            mitglied,
+            grund,
+            f"{minuten} Minuten",
         )
     except discord.Forbidden:
         await interaction.response.send_message(
@@ -74,7 +136,7 @@ async def kick(interaction: discord.Interaction, mitglied: discord.Member, grund
     if mitglied.id == interaction.guild.owner_id:
         await interaction.response.send_message("Der Serverinhaber kann nicht gekickt werden.", ephemeral=True)
         return
-    if mitglied.top_role >= interaction.user.top_role and interaction.user.id != interaction.guild.owner_id:
+    if target_is_higher(interaction, mitglied):
         await interaction.response.send_message("Die Rolle dieses Mitglieds ist gleich hoch oder höher als deine.", ephemeral=True)
         return
     if not interaction.guild.me.guild_permissions.kick_members:
@@ -84,6 +146,7 @@ async def kick(interaction: discord.Interaction, mitglied: discord.Member, grund
     try:
         await mitglied.kick(reason=grund)
         await interaction.response.send_message(f"{mitglied} wurde gekickt. Grund: {grund}")
+        await log_action(interaction.guild, "Kick", interaction.user, mitglied, grund)
     except discord.Forbidden:
         await interaction.response.send_message(
             "Nexora kann dieses Mitglied nicht kicken. Prüfe die Bot-Berechtigungen und die Rollenreihenfolge.",
@@ -100,7 +163,7 @@ async def ban(interaction: discord.Interaction, mitglied: discord.Member, grund:
     if mitglied.id == interaction.guild.owner_id:
         await interaction.response.send_message("Der Serverinhaber kann nicht gebannt werden.", ephemeral=True)
         return
-    if mitglied.top_role >= interaction.user.top_role and interaction.user.id != interaction.guild.owner_id:
+    if target_is_higher(interaction, mitglied):
         await interaction.response.send_message("Die Rolle dieses Mitglieds ist gleich hoch oder höher als deine.", ephemeral=True)
         return
     if not interaction.guild.me.guild_permissions.ban_members:
@@ -110,6 +173,7 @@ async def ban(interaction: discord.Interaction, mitglied: discord.Member, grund:
     try:
         await mitglied.ban(reason=grund)
         await interaction.response.send_message(f"{mitglied} wurde gebannt. Grund: {grund}")
+        await log_action(interaction.guild, "Ban", interaction.user, mitglied, grund)
     except discord.Forbidden:
         await interaction.response.send_message(
             "Nexora kann dieses Mitglied nicht bannen. Prüfe die Bot-Berechtigungen und die Rollenreihenfolge.",
@@ -133,4 +197,3 @@ async def on_app_command_error(
         await interaction.response.send_message(message, ephemeral=True)
 
 bot.run(TOKEN)
-
