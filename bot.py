@@ -357,6 +357,79 @@ async def warnung_loeschen(
         "Verwarnung gelöscht",
         f"Verwarnungs-ID: `{warnungs_id}`\nModerator: {interaction.user.mention}",
     )
+async def create_server_structure(
+    guild: discord.Guild,
+    roles: list[str],
+    categories: list[dict],
+):
+    """Erstellt die vorgeschlagenen Rollen, Kategorien und Text-/Voice-Channels."""
+    bot_member = guild.me
+    if bot_member is None or not bot_member.guild_permissions.manage_roles:
+        raise discord.Forbidden(
+            response=None,
+            message="Dem Bot fehlt die Berechtigung „Rollen verwalten“.",
+        )
+
+    if not bot_member.guild_permissions.manage_channels:
+        raise discord.Forbidden(
+            response=None,
+            message="Dem Bot fehlt die Berechtigung „Kanäle verwalten“.",
+        )
+
+    # Rollen erstellen; @everyone und bereits vorhandene Rollen überspringen.
+    existing_roles = {role.name.casefold() for role in guild.roles}
+    for role_name in roles:
+        role_name = str(role_name).strip()[:100]
+        if not role_name or role_name.casefold() in existing_roles:
+            continue
+
+        await guild.create_role(name=role_name, reason="Serverstruktur aus dem Dashboard")
+        existing_roles.add(role_name.casefold())
+
+    # Kategorien und darin aufgeführte Channels erstellen.
+    for category_data in categories:
+        category_name = str(category_data.get("name", "")).strip()[:100]
+        if not category_name:
+            continue
+
+        category = discord.utils.get(guild.categories, name=category_name)
+        if category is None:
+            category = await guild.create_category(
+                name=category_name,
+                reason="Serverstruktur aus dem Dashboard",
+            )
+
+        for channel_data in category_data.get("channels", []):
+            channel_text = str(channel_data).strip()
+            if not channel_text:
+                continue
+
+            is_voice = channel_text.lower().startswith("voice:")
+            channel_name = (
+                channel_text.split(":", 1)[1].strip()
+                if is_voice
+                else channel_text
+            )
+            channel_name = channel_name[:100]
+            if not channel_name:
+                continue
+
+            if is_voice:
+                exists = discord.utils.get(category.voice_channels, name=channel_name)
+                if exists is None:
+                    await guild.create_voice_channel(
+                        name=channel_name,
+                        category=category,
+                        reason="Serverstruktur aus dem Dashboard",
+                    )
+            else:
+                exists = discord.utils.get(category.text_channels, name=channel_name)
+                if exists is None:
+                    await guild.create_text_channel(
+                        name=channel_name,
+                        category=category,
+                        reason="Serverstruktur aus dem Dashboard",
+                    )
 
 def run_dashboard():
     port = int(os.getenv("SERVER_PORT", "5000"))
