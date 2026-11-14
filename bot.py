@@ -370,11 +370,17 @@ async def create_server_structure(
             message="Dem Bot fehlt die Berechtigung „Rollen verwalten“.",
         )
 
-    if not bot_member.guild_permissions.manage_channels:
-        raise discord.Forbidden(
-            response=None,
-            message="Dem Bot fehlt die Berechtigung „Kanäle verwalten“.",
-        )
+    bot_member = guild.me
+
+if bot_member is None:
+    raise PermissionError("Der Bot konnte auf diesem Server nicht gefunden werden.")
+
+if not bot_member.guild_permissions.manage_roles:
+    raise PermissionError("Dem Bot fehlt die Berechtigung „Rollen verwalten“.")
+
+if not bot_member.guild_permissions.manage_channels:
+    raise PermissionError("Dem Bot fehlt die Berechtigung „Kanäle verwalten“. ")
+
 
     # Rollen erstellen; @everyone und bereits vorhandene Rollen überspringen.
     existing_roles = {role.name.casefold() for role in guild.roles}
