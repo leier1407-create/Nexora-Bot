@@ -1,5 +1,6 @@
 import asyncio
 import html
+import json
 import os
 import sqlite3
 from urllib.parse import urlencode
@@ -34,9 +35,10 @@ DISCORD_REDIRECT_URI = os.getenv(
 )
 DATABASE_PATH = os.getenv("DATABASE_PATH", "warnings.db")
 DISCORD_API = "https://discord.com/api/v10"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
 discord_bot = None
 
 PAGE = """
@@ -209,16 +211,14 @@ def get_structure_function():
         return None
 
     # Die Funktion ist in bot.py definiert.
-    return discord_bot.__class__.__module__ and getattr(
+    return getattr(
         __import__("__main__"),
         "create_server_structure",
         None,
     )
 
 def parse_structure(text):
-    """Liest ein JSON-Objekt mit roles und categories aus der OpenAI-Antwort."""
-    import json
-
+    """Liest JSON mit roles und categories aus der Gemini-Antwort."""
     data = json.loads(text)
 
     roles = data.get("roles", [])
@@ -258,35 +258,31 @@ def parse_structure(text):
     return {"roles": clean_roles, "categories": clean_categories}
 
 def generate_server_template(description):
-    if openai_client is None:
-        raise RuntimeError("Die Umgebungsvariable OPENAI_API_KEY fehlt.")
+    if gemini_client is None:
+        raise RuntimeError("Die Umgebungsvariable GEMINI_API_KEY fehlt.")
 
-    response = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Erstelle eine sinnvolle Discord-Serverstruktur. "
-                    "Antworte ausschließlich als JSON mit diesem Schema: "
-                    '{"roles":["Rollenname"],"categories":'
-                    '[{"name":"Kategoriename","channels":["textkanal",'
-                    '"voice: Sprachkanal"]}]}. '
-                    "Voice-Channels müssen mit 'voice:' beginnen. "
-                    "Gib keine Markdown-Codeblöcke aus."
-                ),
-            },
-            {
-                "role": "user",
-                "content": description[:4000],
-            },
-        ],
+    prompt = (
+        "Erstelle eine sinnvolle Discord-Serverstruktur. "
+        "Antworte ausschließlich als JSON mit diesem Schema: "
+        '{"roles":["Rollenname"],"categories":'
+        '[{"name":"Kategoriename","channels":["textkanal",'
+        '"voice: Sprachkanal"]}]}. '
+        "Voice-Channels müssen mit 'voice:' beginnen. "
+        "Gib keine Markdown-Codeblöcke aus.\n\n"
+        f"Beschreibung des Servers:\n{description[:4000]}"
     )
 
-    content = response.choices[0].message.content
+    response = gemini_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config={
+            "response_mime_type": "application/json",
+        },
+    )
+
+    content = response.text
     if not content:
-        raise ValueError("Die KI hat keine Serverstruktur zurückgegeben.")
+        raise ValueError("Gemini hat keine Serverstruktur zurückgegeben.")
 
     return parse_structure(content)
 
@@ -536,7 +532,7 @@ def server_template_preview(guild_id):
         app.logger.exception("Serverstruktur-Vorschau konnte nicht erstellt werden.")
         return (
             "Die Vorschau konnte nicht erstellt werden. "
-            "Prüfe OPENAI_API_KEY und die Serverprotokolle.",
+            "Prüfe GEMINI_API_KEY und die Serverprotokolle.",
             502,
         )
 
@@ -844,4 +840,3 @@ def send_panel(guild_id, template_id):
         f'<p><a href="{url_for("edit_template", guild_id=guild_id, template_id=template_id)}">'
         "Zurück zur Vorlage</a></p>"
     )
-
