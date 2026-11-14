@@ -3,4 +3,4 @@ aiosqlite
 python-dotenv
 
 Flask>=3.0,<4
-request>=2.4,<3
+requests>=2.4,<3
