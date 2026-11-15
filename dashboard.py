@@ -275,9 +275,7 @@ def generate_server_template(description):
     response = gemini_client.models.generate_content(
         model="gemini-3.8-flash",
         contents=prompt,
-        config={
-            "response_mime_type": "application/json",
-        },
+        config={"response_mime_type": "application/json"},
     )
 
     content = response.text
@@ -285,47 +283,6 @@ def generate_server_template(description):
         raise ValueError("Gemini hat keine Serverstruktur zurückgegeben.")
 
     return parse_structure(content)
-
-def get_proposal():
-    proposal = session.get("server_structure_proposal")
-    if not isinstance(proposal, dict):
-        return None
-
-    roles = proposal.get("roles")
-    categories = proposal.get("categories")
-
-    if not isinstance(roles, list) or not isinstance(categories, list):
-        return None
-
-    return proposal
-
-def render_structure_preview(proposal):
-    role_items = "".join(
-        f"<li>{escape(role)}</li>" for role in proposal["roles"]
-    ) or "<li>Keine Rollen vorgeschlagen.</li>"
-
-    category_parts = []
-    for category in proposal["categories"]:
-        channel_items = "".join(
-            f"<li>{escape(channel)}</li>"
-            for channel in category.get("channels", [])
-        ) or "<li>Keine Channels.</li>"
-
-        category_parts.append(
-            f"<h3>{escape(category.get('name', ''))}</h3>"
-            f"<ul>{channel_items}</ul>"
-        )
-
-    categories_html = "".join(category_parts) or "<p>Keine Kategorien.</p>"
-
-    return (
-        "<div class='preview'>"
-        "<h2>Vorgeschlagene Rollen</h2>"
-        f"<ul>{role_items}</ul>"
-        "<h2>Kategorien und Channels</h2>"
-        f"{categories_html}"
-        "</div>"
-    )
 
 @app.get("/")
 def index():
@@ -486,15 +443,15 @@ def guild_dashboard(guild_id):
         <h1>{escape(guild_data["name"])}</h1>
 
         <h2>Serverstruktur erstellen</h2>
-        <p>Beschreibe den Server. Danach kannst du den Vorschlag prüfen,
-        bevor Rollen, Kategorien und Channels angelegt werden.</p>
+        <p>Beschreibe den Server. Rollen, Kategorien und Channels werden
+        nach dem Absenden direkt angelegt.</p>
         <form method="post"
-              action="{url_for('server_template_preview', guild_id=guild_id)}">
+              action="{url_for('create_server_template', guild_id=guild_id)}">
           <label>Beschreibung
             <textarea name="description" maxlength="4000" required
               placeholder="Zum Beispiel: Gaming-Server mit Begrüßungs-, Chat-, Support- und Sprachkanälen sowie Moderator- und Mitgliedsrollen."></textarea>
           </label>
-          <button type="submit">Vorschau erstellen</button>
+          <button type="submit">Serverstruktur erstellen</button>
         </form>
 
         <h2>Panel-Vorlage erstellen</h2>
@@ -511,8 +468,8 @@ def guild_dashboard(guild_id):
         """
     )
 
-@app.post("/guild/<guild_id>/server-template/preview")
-def server_template_preview(guild_id):
+@app.post("/guild/<guild_id>/server-template/create")
+def create_server_template(guild_id):
     login_redirect = require_login()
     if login_redirect:
         return login_redirect
@@ -525,51 +482,6 @@ def server_template_preview(guild_id):
     description = request.form.get("description", "").strip()
     if not description:
         abort(400, "Bitte gib eine Beschreibung ein.")
-
-    try:
-        proposal = generate_server_template(description)
-    except Exception:
-        app.logger.exception("Serverstruktur-Vorschau konnte nicht erstellt werden.")
-        return (
-            "Die Vorschau konnte nicht erstellt werden. "
-            "Prüfe GEMINI_API_KEY und die Serverprotokolle.",
-            502,
-        )
-
-    session["server_structure_proposal"] = proposal
-    preview_html = render_structure_preview(proposal)
-
-    return render_page(
-        f"""
-        <p><a href="{url_for('guild_dashboard', guild_id=guild_id)}">
-          Zurück zum Server
-        </a></p>
-        <h1>Serverstruktur-Vorschau für {escape(guild_data["name"])}</h1>
-        {preview_html}
-        <form method="post"
-              action="{url_for('create_server_template', guild_id=guild_id)}">
-          <button type="submit">Struktur auf dem Server erstellen</button>
-        </form>
-        """
-    )
-
-@app.post("/guild/<guild_id>/server-template/create")
-def create_server_template(guild_id):
-    login_redirect = require_login()
-    if login_redirect:
-        return login_redirect
-
-    try:
-        guild_data = authorize_guild(guild_id)
-    except requests.RequestException:
-        return "Die Serverberechtigung konnte nicht geprüft werden.", 502
-
-    proposal = get_proposal()
-    if proposal is None:
-        return (
-            "Keine gültige Vorschau gefunden. Erstelle zuerst eine neue Vorschau.",
-            400,
-        )
 
     if discord_bot is None or not discord_bot.is_ready():
         return "Der Bot ist noch nicht bereit. Lade die Seite erneut.", 503
@@ -586,11 +498,13 @@ def create_server_template(guild_id):
         )
 
     try:
+        structure = generate_server_template(description)
+
         future = asyncio.run_coroutine_threadsafe(
             structure_function(
                 guild,
-                proposal["roles"],
-                proposal["categories"],
+                structure["roles"],
+                structure["categories"],
             ),
             discord_bot.loop,
         )
@@ -599,16 +513,14 @@ def create_server_template(guild_id):
         app.logger.exception("Serverstruktur konnte nicht erstellt werden.")
         return (
             "Die Serverstruktur konnte nicht erstellt werden. "
-            "Prüfe Bot-Berechtigungen und Rollenreihenfolge.",
+            "Prüfe GEMINI_API_KEY, Bot-Berechtigungen und Rollenreihenfolge.",
             502,
         )
-
-    session.pop("server_structure_proposal", None)
 
     return render_page(
         f"""
         <h1>Serverstruktur erstellt</h1>
-        <p>Die vorgeschlagenen Rollen, Kategorien und Channels für
+        <p>Rollen, Kategorien und Channels für
         {escape(guild_data["name"])} wurden angelegt.</p>
         <p><a href="{url_for('guild_dashboard', guild_id=guild_id)}">
           Zurück zum Server-Dashboard
