@@ -1,48 +1,62 @@
-import logging
+import asyncio
+import html
 import os
 import re
-from collections import defaultdict, deque
-from datetime import timedelta
-from threading import Thread
+import secrets
+import sqlite3
+from urllib.parse import urlencode
 
-import aiosqlite
 import discord
-from discord import app_commands
-from discord.ext import commands
+import requests
 from dotenv import load_dotenv
-
-from dashboard import app, configure_bot
+from flask import Flask, abort, redirect, render_template_string, request, session, url_for
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("nexora")
+app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "")
+if not app.secret_key:
+    raise RuntimeError("Die Umgebungsvariable FLASK_SECRET_KEY fehlt.")
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
+DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
+DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI", "")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "warnings.db")
-FALLBACK_MOD_LOG_CHANNEL_ID = int(os.getenv("MOD_LOG_CHANNEL_ID", "0"))
-if not TOKEN:
-    raise RuntimeError("Die Umgebungsvariable DISCORD_TOKEN fehlt.")
+DISCORD_API = "https://discord.com/api/v10"
+discord_bot = None
 
-intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-configure_bot(bot)
-message_timestamps = defaultdict(lambda: deque(maxlen=20))
-LINK_PATTERN = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+PAGE = """<!doctype html>
+<html lang=\"de\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>Nexora Dashboard</title>
+  <style>
+    body { margin: 0; padding: 24px; background: #111827; color: #f9fafb; font: 16px system-ui, sans-serif; }
+    main { max-width: 1100px; margin: 24px auto; padding: 24px; border: 1px solid #374151; border-radius: 16px; background: #1f2937; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 16px; }
+    .card { margin: 18px 0; padding: 18px; background: #111827; border: 1px solid #374151; border-radius: 12px; }
+    input, textarea, select, button { box-sizing: border-box; width: 100%; margin: 7px 0 16px; padding: 11px; border: 1px solid #4b5563; border-radius: 8px; background: #111827; color: #f9fafb; font: inherit; }
+    textarea { min-height: 100px; resize: vertical; }
+    button, .button { display: inline-block; width: auto; padding: 11px 16px; border: 0; border-radius: 8px; background: #4E5B31; color: white; cursor: pointer; text-decoration: none; }
+    a { color: #93c5fd; }
+    label { display: block; margin-top: 10px; }
+    ul { padding-left: 20px; }
+    .muted { color: #9ca3af; }
+  </style>
+</head>
+<body>
+  <main>{{ content|safe }}</main>
+</body>
+</html>"""
 
 
-async def initialize_database():
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute("""CREATE TABLE IF NOT EXISTS warnings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            moderator_id INTEGER NOT NULL,
-            reason TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS guild_settings (
+def configure_bot(bot):
+    globals()['discord_bot'] = bot
+
+
+def init_db():
+    with sqlite3.connect(DATABASE_PATH) as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS guild_settings (
             guild_id TEXT PRIMARY KEY,
             mod_log_channel_id TEXT NOT NULL DEFAULT '',
             welcome_channel_id TEXT NOT NULL DEFAULT '',
@@ -62,9 +76,25 @@ async def initialize_database():
             afk_channel_id TEXT NOT NULL DEFAULT '',
             afk_role_id TEXT NOT NULL DEFAULT '',
             backup_hour INTEGER NOT NULL DEFAULT 3,
-            backup_enabled INTEGER NOT NULL DEFAULT 0
+            backup_enabled INTEGER NOT NULL DEFAULT 0,
+            suggestion_channel_id TEXT NOT NULL DEFAULT '',
+            application_channel_id TEXT NOT NULL DEFAULT '',
+            application_role_id TEXT NOT NULL DEFAULT '',
+            giveaway_channel_id TEXT NOT NULL DEFAULT '',
+            backup_channel_id TEXT NOT NULL DEFAULT '',
+            stats_channel_id TEXT NOT NULL DEFAULT ''
         )""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS reaction_roles (
+        db.execute("""CREATE TABLE IF NOT EXISTS panel_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id TEXT NOT NULL,
+            guild_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            color TEXT NOT NULL DEFAULT '#4E5B31',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS reaction_roles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id TEXT NOT NULL,
             channel_id TEXT NOT NULL,
@@ -72,11 +102,68 @@ async def initialize_database():
             emoji TEXT NOT NULL,
             role_id TEXT NOT NULL
         )""")
-        await db.commit()
+        db.commit()
 
 
-async def get_guild_settings(guild_id):
+init_db()
+
+
+def esc(value):
+    return html.escape(str(value), quote=True)
+
+
+def csrf_input():
+    token = session.setdefault("csrf_token", secrets.token_urlsafe(32))
+    return f'<input type="hidden" name="csrf_token" value="{esc(token)}">'
+
+
+@app.before_request
+def check_csrf():
+    if request.method == "POST":
+        expected = session.get("csrf_token", "")
+        supplied = request.form.get("csrf_token", "")
+        if not expected or not secrets.compare_digest(expected, supplied):
+            abort(400, "Ungültige oder abgelaufene Formularsitzung. Bitte Seite neu laden.")
+
+
+def render_page(content):
+    return render_template_string(PAGE, content=content)
+
+
+def require_login():
+    if not session.get("discord_id") or not session.get("access_token"):
+        return redirect(url_for("login"))
+    return None
+
+
+def get_user_guilds():
+    response = requests.get(
+        f"{DISCORD_API}/users/@me/guilds",
+        headers={"Authorization": f"Bearer {session['access_token']}"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def can_manage_guild(guild_data):
+    permissions = int(guild_data.get("permissions", "0"))
+    return bool(permissions & 32 or permissions & 8)
+
+
+def authorize_guild(guild_id):
+    for guild_data in get_user_guilds():
+        if guild_data["id"] == str(guild_id) and can_manage_guild(guild_data):
+            return guild_data
+    abort(403, "Du brauchst auf diesem Server Serververwaltungsrechte oder Administrator.")
+
+
+def db_settings(guild_id):
+    with sqlite3.connect(DATABASE_PATH) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT * FROM guild_settings WHERE guild_id = ?", (str(guild_id),)).fetchone()
     defaults = {
+        "guild_id": str(guild_id),
         "mod_log_channel_id": "",
         "welcome_channel_id": "",
         "leave_channel_id": "",
@@ -96,860 +183,748 @@ async def get_guild_settings(guild_id):
         "afk_role_id": "",
         "backup_hour": 3,
         "backup_enabled": 0,
+        "suggestion_channel_id": "",
+        "application_channel_id": "",
+        "application_role_id": "",
+        "giveaway_channel_id": "",
+        "backup_channel_id": "",
+        "stats_channel_id": "",
     }
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM guild_settings WHERE guild_id=?", (str(guild_id),))
-        row = await cursor.fetchone()
     if row:
         defaults.update(dict(row))
     return defaults
 
 
-async def log_moderation(guild, title, description):
-    if guild is None:
-        return
-    settings = await get_guild_settings(guild.id)
+def get_template(template_id, owner_id, guild_id):
+    with sqlite3.connect(DATABASE_PATH) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute(
+            "SELECT id,name,title,body,color FROM panel_templates WHERE id=? AND owner_id=? AND guild_id=?",
+            (template_id, str(owner_id), str(guild_id)),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def safe_color(value):
+    if isinstance(value, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        return value
+    return "#4E5B31"
+
+
+def run_bot_coroutine(coro, timeout=30):
+    if discord_bot is None or not discord_bot.is_ready():
+        raise RuntimeError("Der Bot ist noch nicht bereit.")
+    return asyncio.run_coroutine_threadsafe(coro, discord_bot.loop).result(timeout=timeout)
+
+
+@app.get("/")
+def index():
+    if session.get("discord_id"):
+        content = (
+            f"<h1>Nexora Dashboard</h1>"
+            f"<p>Angemeldet als {esc(session.get('username', 'Discord-Nutzer'))}</p>"
+            f"<p><a class='button' href='{url_for('servers')}'>Server auswählen</a> "
+            f"<a href='{url_for('logout')}'>Abmelden</a></p>"
+        )
+    else:
+        content = (
+            "<h1>Nexora Dashboard</h1>"
+            "<p>Konfiguriere Bot-Funktionen für Server, die du verwalten darfst.</p>"
+            "<a class='button' href='{url_for('login')}'>Mit Discord anmelden</a>"
+        )
+    return render_page(content)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/login")
+def login():
+    if not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET or not DISCORD_REDIRECT_URI:
+        return "DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET und DISCORD_REDIRECT_URI müssen gesetzt sein.", 500
+    state = secrets.token_urlsafe(32)
+    session["oauth_state"] = state
+    params = {
+        "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": DISCORD_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "identify guilds",
+        "state": state,
+    }
+    return redirect(f"https://discord.com/oauth2/authorize?{urlencode(params)}")
+
+
+@app.get("/callback")
+def callback():
+    if request.args.get("error"):
+        return "Discord-Anmeldung wurde abgebrochen.", 400
+    code = request.args.get("code")
+    state = request.args.get("state", "")
+    expected_state = session.pop("oauth_state", "")
+    if not code or not expected_state or not secrets.compare_digest(state, expected_state):
+        return "Ungültige OAuth-Anfrage. Bitte erneut anmelden.", 400
+
+    token_response = requests.post(
+        f"{DISCORD_API}/oauth2/token",
+        data={
+            "client_id": DISCORD_CLIENT_ID,
+            "client_secret": DISCORD_CLIENT_SECRET,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": DISCORD_REDIRECT_URI,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=15,
+    )
+    if not token_response.ok:
+        app.logger.error("Discord-Token-Austausch fehlgeschlagen: %s", token_response.text)
+        return "Discord-Anmeldung fehlgeschlagen. Prüfe Client-Daten und Redirect-URL.", 400
+
+    access_token = token_response.json().get("access_token")
+    if not access_token:
+        return "Discord hat kein Zugriffstoken zurückgegeben.", 400
+
+    user_response = requests.get(
+        f"{DISCORD_API}/users/@me",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=15,
+    )
+    if not user_response.ok:
+        return "Discord-Benutzer konnte nicht geladen werden.", 400
+
+    user = user_response.json()
+    session.clear()
+    session["access_token"] = access_token
+    session["username"] = user.get("global_name") or user.get("username") or "Discord-Nutzer"
+    session["discord_id"] = user["id"]
+    session["csrf_token"] = secrets.token_urlsafe(32)
+    return redirect(url_for("servers"))
+
+
+@app.get("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("index"))
+
+
+@app.get("/servers")
+def servers():
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
     try:
-        channel_id = int(settings["mod_log_channel_id"] or FALLBACK_MOD_LOG_CHANNEL_ID)
-    except (TypeError, ValueError):
-        channel_id = 0
-    channel = guild.get_channel(channel_id) if channel_id else None
+        manageable = [g for g in get_user_guilds() if can_manage_guild(g)]
+    except requests.RequestException:
+        return "Die Discord-Serverliste konnte nicht geladen werden.", 502
+    if not manageable:
+        return render_page("<h1>Keine verwaltbaren Server gefunden</h1><p>Du brauchst Server verwalten oder Administrator.</p>")
+
+    links = "".join(
+        f'<li><a href="{url_for("guild_dashboard", guild_id=g["id"])}">{esc(g["name"])}</a></li>'
+        for g in manageable
+    )
+    return render_page(f"<h1>Server auswählen</h1><ul>{links}</ul><p><a href='{url_for('logout')}'>Abmelden</a></p>")
+
+
+@app.get("/guild/<guild_id>")
+def guild_dashboard(guild_id):
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
+    try:
+        guild_data = authorize_guild(guild_id)
+    except requests.RequestException:
+        return "Die Serverberechtigung konnte nicht geprüft werden.", 502
+    if discord_bot is None or not discord_bot.is_ready():
+        return "Der Bot ist noch nicht bereit. Lade die Seite erneut.", 503
+    guild = discord_bot.get_guild(int(guild_id))
+    if guild is None:
+        return "Der Bot ist diesem Server nicht beigetreten.", 404
+
+    settings = db_settings(guild_id)
+
+    def select_options(items, current_value, kind='channel'):
+        out = '<option value="">— Nicht festgelegt —</option>'
+        for item in items:
+            selected = ' selected' if str(current_value) == str(item.id) else ''
+            label = item.name
+            out += f'<option value="{item.id}"{selected}>{esc(label)}</option>'
+        return out
+
+    def role_options(roles, current_value):
+        out = '<option value="">— Nicht festgelegt —</option>'
+        for role in roles:
+            if role.name == '@everyone':
+                continue
+            selected = ' selected' if str(current_value) == str(role.id) else ''
+            out += f'<option value="{role.id}"{selected}>{esc(role.name)}</option>'
+        return out
+
+    mod_log = select_options(guild.text_channels, settings["mod_log_channel_id"])
+    welcome_channel = select_options(guild.text_channels, settings["welcome_channel_id"])
+    leave_channel = select_options(guild.text_channels, settings["leave_channel_id"])
+    ticket_support = role_options(guild.roles, settings["support_role_id"])
+    ticket_category = select_options(guild.categories, settings["ticket_category_id"])
+    ticket_log = select_options(guild.text_channels, settings["ticket_log_channel_id"])
+    verify_role = role_options(guild.roles, settings["verification_role_id"])
+    verify_channel = select_options(guild.text_channels, settings["verification_channel_id"])
+    afk_channel = select_options(guild.voice_channels, settings["afk_channel_id"])
+    afk_role = role_options(guild.roles, settings["afk_role_id"])
+    suggestion_channel = select_options(guild.text_channels, settings["suggestion_channel_id"])
+    application_channel = select_options(guild.text_channels, settings["application_channel_id"])
+    application_role = role_options(guild.roles, settings["application_role_id"])
+    giveaway_channel = select_options(guild.text_channels, settings["giveaway_channel_id"])
+    backup_channel = select_options(guild.text_channels, settings["backup_channel_id"])
+    stats_channel = select_options(guild.text_channels, settings["stats_channel_id"])
+
+    template_rows = []
+    with sqlite3.connect(DATABASE_PATH) as db:
+        rows = db.execute(
+            "SELECT id,name FROM panel_templates WHERE owner_id=? AND guild_id=? ORDER BY id DESC",
+            (str(session["discord_id"]), str(guild_id)),
+        ).fetchall()
+    template_rows = rows
+    templates = "".join(
+        f'<li><a href="{url_for("edit_template", guild_id=guild_id, template_id=row[0])}">{esc(row[1])}</a></li>'
+        for row in template_rows
+    ) or "<li>Noch keine Vorlagen.</li>"
+
+    content = f"""
+    <p><a href='{url_for('servers')}'>← Serverauswahl</a></p>
+    <h1>{esc(guild_data['name'])}</h1>
+
+    <div class='card'>
+      <h2>Grundfunktionen</h2>
+      <form method='post' action='{url_for('save_settings', guild_id=guild_id)}'>{csrf_input()}
+        <label>Moderations-Log-Kanal<select name='mod_log_channel_id'>{mod_log}</select></label>
+        <label>Begrüßungskanal<select name='welcome_channel_id'>{welcome_channel}</select></label>
+        <label>Begrüßungsnachricht<textarea name='welcome_message'>{esc(settings['welcome_message'])}</textarea></label>
+        <label>Abschiedskanal<select name='leave_channel_id'>{leave_channel}</select></label>
+        <label>Abschiedsnachricht<textarea name='leave_message'>{esc(settings['leave_message'])}</textarea></label>
+        <label><input style='width:auto' type='checkbox' name='links_enabled' {'checked' if settings['links_enabled'] else ''}> Links blockieren</label>
+        <label><input style='width:auto' type='checkbox' name='spam_enabled' {'checked' if settings['spam_enabled'] else ''}> Spam erkennen</label>
+        <label>Spam-Limit (3–12)<input type='number' name='spam_limit' min='3' max='12' value='{int(settings['spam_limit'])}'></label>
+        <label>Spam-Fenster (3–30 Sekunden)<input type='number' name='spam_window_seconds' min='3' max='30' value='{int(settings['spam_window_seconds'])}'></label>
+        <button>Konfiguration speichern</button>
+      </form>
+    </div>
+
+    <div class='grid'>
+      <div class='card'>
+        <h2>Support & Tickets</h2>
+        <form method='post' action='{url_for('save_support_settings', guild_id=guild_id)}'>{csrf_input()}
+          <label>Support-Rolle<select name='support_role_id'>{ticket_support}</select></label>
+          <label>Ticket-Kategorie<select name='ticket_category_id'>{ticket_category}</select></label>
+          <label>Ticket-Log-Kanal<select name='ticket_log_channel_id'>{ticket_log}</select></label>
+          <button>Support speichern</button>
+        </form>
+      </div>
+
+      <div class='card'>
+        <h2>Verifizierung</h2>
+        <form method='post' action='{url_for('save_verification_settings', guild_id=guild_id)}'>{csrf_input()}
+          <label>Verifizierungs-Rolle<select name='verification_role_id'>{verify_role}</select></label>
+          <label>Verifizierungs-Kanal<select name='verification_channel_id'>{verify_channel}</select></label>
+          <label>Nachricht<textarea name='verification_message'>{esc(settings['verification_message'])}</textarea></label>
+          <button>Verifizierung speichern</button>
+        </form>
+      </div>
+
+      <div class='card'>
+        <h2>AFK & Backup</h2>
+        <form method='post' action='{url_for('save_afk_settings', guild_id=guild_id)}'>{csrf_input()}
+          <label>AFK-Sprachkanal<select name='afk_channel_id'>{afk_channel}</select></label>
+          <label>AFK-Rolle<select name='afk_role_id'>{afk_role}</select></label>
+          <label>Backup-Stunde (0–23)<input type='number' name='backup_hour' min='0' max='23' value='{int(settings['backup_hour'])}'></label>
+          <label><input style='width:auto' type='checkbox' name='backup_enabled' {'checked' if settings['backup_enabled'] else ''}> Backup aktivieren</label>
+          <label>Backup-Log-Kanal<select name='backup_channel_id'>{backup_channel}</select></label>
+          <button>AFK/Backup speichern</button>
+        </form>
+      </div>
+    </div>
+
+    <div class='grid'>
+      <div class='card'>
+        <h2>Vorschläge</h2>
+        <form method='post' action='{url_for('save_extra_settings', guild_id=guild_id)}'>{csrf_input()}
+          <label>Vorschlags-Kanal<select name='suggestion_channel_id'>{suggestion_channel}</select></label>
+          <label>Bewerbungs-Kanal<select name='application_channel_id'>{application_channel}</select></label>
+          <label>Bewerbungs-Rolle<select name='application_role_id'>{application_role}</select></label>
+          <label>Giveaway-Kanal<select name='giveaway_channel_id'>{giveaway_channel}</select></label>
+          <label>Stats-Kanal<select name='stats_channel_id'>{stats_channel}</select></label>
+          <button>Erweiterte Funktionen speichern</button>
+        </form>
+      </div>
+
+      <div class='card'>
+        <h2>Rolle erstellen</h2>
+        <form method='post' action='{url_for('create_role', guild_id=guild_id)}'>{csrf_input()}
+          <label>Rollenname<input name='name' maxlength='100' required></label>
+          <button>Rolle erstellen</button>
+        </form>
+      </div>
+
+      <div class='card'>
+        <h2>Kanal erstellen</h2>
+        <form method='post' action='{url_for('create_channel', guild_id=guild_id)}'>{csrf_input()}
+          <label>Kanalname<input name='name' maxlength='100' required placeholder='allgemein'></label>
+          <label>Typ<select name='kind'><option value='text'>Textkanal</option><option value='voice'>Sprachkanal</option></select></label>
+          <button>Kanal erstellen</button>
+        </form>
+      </div>
+    </div>
+
+    <div class='card'>
+      <h2>Panel-Vorlagen</h2>
+      <form method='post' action='{url_for('create_template', guild_id=guild_id)}'>{csrf_input()}
+        <label>Vorlagenname<input name='name' maxlength='80' required></label>
+        <button>Vorlage erstellen</button>
+      </form>
+      <ul>{templates}</ul>
+    </div>
+
+    <p class='muted'>Automatische Moderation, Tickets, Vorschläge, Giveaways, Bewerbungen und Statistiken sind über das Dashboard aktivierbar.</p>
+    """
+    return render_page(content)
+
+
+@app.post("/guild/<guild_id>/settings")
+def save_settings(guild_id):
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
+    try:
+        authorize_guild(guild_id)
+    except requests.RequestException:
+        return "Die Serverberechtigung konnte nicht geprüft werden.", 502
+
+    guild = discord_bot.get_guild(int(guild_id)) if discord_bot and discord_bot.is_ready() else None
+    if guild is None:
+        return "Der Bot ist diesem Server nicht beigetreten.", 404
+
+    def channel_value(field):
+        value = request.form.get(field, "").strip()
+        if not value:
+            return ""
+        try:
+            channel_id = int(value)
+        except ValueError:
+            abort(400, "Ungültiger Kanal.")
+        if not isinstance(guild.get_channel(channel_id), discord.TextChannel):
+            abort(400, "Der ausgewählte Kanal ist kein Textkanal dieses Servers.")
+        return str(channel_id)
+
+    try:
+        limit = max(3, min(12, int(request.form.get("spam_limit", "5"))))
+        window = max(3, min(30, int(request.form.get("spam_window_seconds", "8"))))
+    except ValueError:
+        abort(400, "Spam-Limit und Zeitfenster müssen Zahlen sein.")
+
+    with sqlite3.connect(DATABASE_PATH) as db:
+        db.execute(
+            """INSERT INTO guild_settings (
+                guild_id, mod_log_channel_id, welcome_channel_id, leave_channel_id,
+                welcome_message, leave_message, links_enabled, spam_enabled,
+                spam_limit, spam_window_seconds, support_role_id, ticket_category_id,
+                ticket_log_channel_id, verification_role_id, verification_channel_id,
+                verification_message, afk_channel_id, afk_role_id, backup_hour,
+                backup_enabled, suggestion_channel_id, application_channel_id,
+                application_role_id, giveaway_channel_id, backup_channel_id,
+                stats_channel_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', '', '', '', 'Bitte verifiziere dich mit dem Button oder Befehl.', '', '', 3, 0, '', '', '', '', '', '')
+            ON CONFLICT(guild_id) DO UPDATE SET
+                mod_log_channel_id=excluded.mod_log_channel_id,
+                welcome_channel_id=excluded.welcome_channel_id,
+                leave_channel_id=excluded.leave_channel_id,
+                welcome_message=excluded.welcome_message,
+                leave_message=excluded.leave_message,
+                links_enabled=excluded.links_enabled,
+                spam_enabled=excluded.spam_enabled,
+                spam_limit=excluded.spam_limit,
+                spam_window_seconds=excluded.spam_window_seconds,
+                support_role_id=excluded.support_role_id,
+                ticket_category_id=excluded.ticket_category_id,
+                ticket_log_channel_id=excluded.ticket_log_channel_id,
+                verification_role_id=excluded.verification_role_id,
+                verification_channel_id=excluded.verification_channel_id,
+                verification_message=excluded.verification_message,
+                afk_channel_id=excluded.afk_channel_id,
+                afk_role_id=excluded.afk_role_id,
+                backup_hour=excluded.backup_hour,
+                backup_enabled=excluded.backup_enabled,
+                suggestion_channel_id=excluded.suggestion_channel_id,
+                application_channel_id=excluded.application_channel_id,
+                application_role_id=excluded.application_role_id,
+                giveaway_channel_id=excluded.giveaway_channel_id,
+                backup_channel_id=excluded.backup_channel_id,
+                stats_channel_id=excluded.stats_channel_id""",
+            (
+                str(guild_id),
+                channel_value("mod_log_channel_id"),
+                channel_value("welcome_channel_id"),
+                channel_value("leave_channel_id"),
+                request.form.get("welcome_message", "").strip()[:1000],
+                request.form.get("leave_message", "").strip()[:1000],
+                int("links_enabled" in request.form),
+                int("spam_enabled" in request.form),
+                limit,
+                window,
+            ),
+        )
+        db.commit()
+    return redirect(url_for("guild_dashboard", guild_id=guild_id))
+
+
+@app.post("/guild/<guild_id>/support")
+def save_support_settings(guild_id):
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
+    try:
+        authorize_guild(guild_id)
+    except requests.RequestException:
+        return "Die Serverberechtigung konnte nicht geprüft werden.", 502
+
+    guild = discord_bot.get_guild(int(guild_id)) if discord_bot and discord_bot.is_ready() else None
+    if guild is None:
+        return "Der Bot ist diesem Server nicht beigetreten.", 404
+
+    support_role_id = request.form.get("support_role_id", "").strip()
+    ticket_category_id = request.form.get("ticket_category_id", "").strip()
+    ticket_log_channel_id = request.form.get("ticket_log_channel_id", "").strip()
+
+    if support_role_id and not any(str(r.id) == support_role_id for r in guild.roles):
+        abort(400, "Die Support-Rolle existiert nicht auf diesem Server.")
+    if ticket_category_id and not any(str(c.id) == ticket_category_id for c in guild.categories):
+        abort(400, "Die Ticket-Kategorie existiert nicht auf diesem Server.")
+    if ticket_log_channel_id and not any(str(c.id) == ticket_log_channel_id for c in guild.text_channels):
+        abort(400, "Der Ticket-Log-Kanal existiert nicht auf diesem Server.")
+
+    with sqlite3.connect(DATABASE_PATH) as db:
+        db.execute(
+            """INSERT INTO guild_settings (guild_id, support_role_id, ticket_category_id, ticket_log_channel_id)
+            VALUES (?, ?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET
+                support_role_id=excluded.support_role_id,
+                ticket_category_id=excluded.ticket_category_id,
+                ticket_log_channel_id=excluded.ticket_log_channel_id""",
+            (str(guild_id), support_role_id, ticket_category_id, ticket_log_channel_id),
+        )
+        db.commit()
+    return redirect(url_for("guild_dashboard", guild_id=guild_id))
+
+
+@app.post("/guild/<guild_id>/verify")
+def save_verification_settings(guild_id):
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
+    try:
+        authorize_guild(guild_id)
+    except requests.RequestException:
+        return "Die Serverberechtigung konnte nicht geprüft werden.", 502
+
+    guild = discord_bot.get_guild(int(guild_id)) if discord_bot and discord_bot.is_ready() else None
+    if guild is None:
+        return "Der Bot ist diesem Server nicht beigetreten.", 404
+
+    verification_role_id = request.form.get("verification_role_id", "").strip()
+    verification_channel_id = request.form.get("verification_channel_id", "").strip()
+    verification_message = request.form.get("verification_message", "").strip()[:1000]
+
+    if verification_role_id and not any(str(r.id) == verification_role_id for r in guild.roles):
+        abort(400, "Die Verifizierungs-Rolle existiert nicht auf diesem Server.")
+    if verification_channel_id and not any(str(c.id) == verification_channel_id for c in guild.text_channels):
+        abort(400, "Der Verifizierungs-Kanal existiert nicht auf diesem Server.")
+
+    with sqlite3.connect(DATABASE_PATH) as db:
+        db.execute(
+            """INSERT INTO guild_settings (guild_id, verification_role_id, verification_channel_id, verification_message)
+            VALUES (?, ?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET
+                verification_role_id=excluded.verification_role_id,
+                verification_channel_id=excluded.verification_channel_id,
+                verification_message=excluded.verification_message""",
+            (str(guild_id), verification_role_id, verification_channel_id, verification_message or "Bitte verifiziere dich mit dem Button oder Befehl."),
+        )
+        db.commit()
+    return redirect(url_for("guild_dashboard", guild_id=guild_id))
+
+
+@app.post("/guild/<guild_id>/afk")
+def save_afk_settings(guild_id):
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
+    try:
+        authorize_guild(guild_id)
+    except requests.RequestException:
+        return "Die Serverberechtigung konnte nicht geprüft werden.", 502
+
+    guild = discord_bot.get_guild(int(guild_id)) if discord_bot and discord_bot.is_ready() else None
+    if guild is None:
+        return "Der Bot ist diesem Server nicht beigetreten.", 404
+
+    afk_channel_id = request.form.get("afk_channel_id", "").strip()
+    afk_role_id = request.form.get("afk_role_id", "").strip()
+    backup_hour = request.form.get("backup_hour", "3").strip()
+    backup_enabled = int("backup_enabled" in request.form)
+    backup_channel_id = request.form.get("backup_channel_id", "").strip()
+
+    if afk_channel_id and not any(str(c.id) == afk_channel_id for c in guild.voice_channels):
+        abort(400, "Der AFK-Sprachkanal existiert nicht auf diesem Server.")
+    if afk_role_id and not any(str(r.id) == afk_role_id for r in guild.roles):
+        abort(400, "Die AFK-Rolle existiert nicht auf diesem Server.")
+    if backup_channel_id and not any(str(c.id) == backup_channel_id for c in guild.text_channels):
+        abort(400, "Der Backup-Log-Kanal existiert nicht auf diesem Server.")
+
+    try:
+        backup_hour_int = max(0, min(23, int(backup_hour)))
+    except ValueError:
+        abort(400, "Die Backup-Stunde muss eine Zahl von 0 bis 23 sein.")
+
+    with sqlite3.connect(DATABASE_PATH) as db:
+        db.execute(
+            """INSERT INTO guild_settings (guild_id, afk_channel_id, afk_role_id, backup_hour, backup_enabled, backup_channel_id)
+            VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET
+                afk_channel_id=excluded.afk_channel_id,
+                afk_role_id=excluded.afk_role_id,
+                backup_hour=excluded.backup_hour,
+                backup_enabled=excluded.backup_enabled,
+                backup_channel_id=excluded.backup_channel_id""",
+            (str(guild_id), afk_channel_id, afk_role_id, backup_hour_int, backup_enabled, backup_channel_id),
+        )
+        db.commit()
+    return redirect(url_for("guild_dashboard", guild_id=guild_id))
+
+
+@app.post("/guild/<guild_id>/extra")
+def save_extra_settings(guild_id):
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
+    try:
+        authorize_guild(guild_id)
+    except requests.RequestException:
+        return "Die Serverberechtigung konnte nicht geprüft werden.", 502
+
+    guild = discord_bot.get_guild(int(guild_id)) if discord_bot and discord_bot.is_ready() else None
+    if guild is None:
+        return "Der Bot ist diesem Server nicht beigetreten.", 404
+
+    suggestion_channel_id = request.form.get("suggestion_channel_id", "").strip()
+    application_channel_id = request.form.get("application_channel_id", "").strip()
+    application_role_id = request.form.get("application_role_id", "").strip()
+    giveaway_channel_id = request.form.get("giveaway_channel_id", "").strip()
+    stats_channel_id = request.form.get("stats_channel_id", "").strip()
+
+    if suggestion_channel_id and not any(str(c.id) == suggestion_channel_id for c in guild.text_channels):
+        abort(400, "Der Vorschlags-Kanal existiert nicht.")
+    if application_channel_id and not any(str(c.id) == application_channel_id for c in guild.text_channels):
+        abort(400, "Der Bewerbungs-Kanal existiert nicht.")
+    if application_role_id and not any(str(r.id) == application_role_id for r in guild.roles):
+        abort(400, "Die Bewerbungs-Rolle existiert nicht.")
+    if giveaway_channel_id and not any(str(c.id) == giveaway_channel_id for c in guild.text_channels):
+        abort(400, "Der Giveaway-Kanal existiert nicht.")
+    if stats_channel_id and not any(str(c.id) == stats_channel_id for c in guild.text_channels):
+        abort(400, "Der Stats-Kanal existiert nicht.")
+
+    with sqlite3.connect(DATABASE_PATH) as db:
+        db.execute(
+            """INSERT INTO guild_settings (
+                guild_id, suggestion_channel_id, application_channel_id,
+                application_role_id, giveaway_channel_id, stats_channel_id
+            ) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET
+                suggestion_channel_id=excluded.suggestion_channel_id,
+                application_channel_id=excluded.application_channel_id,
+                application_role_id=excluded.application_role_id,
+                giveaway_channel_id=excluded.giveaway_channel_id,
+                stats_channel_id=excluded.stats_channel_id""",
+            (str(guild_id), suggestion_channel_id, application_channel_id, application_role_id, giveaway_channel_id, stats_channel_id),
+        )
+        db.commit()
+    return redirect(url_for("guild_dashboard", guild_id=guild_id))
+
+
+@app.post("/guild/<guild_id>/role")
+def create_role(guild_id):
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
+    try:
+        authorize_guild(guild_id)
+    except requests.RequestException:
+        return "Die Serverberechtigung konnte nicht geprüft werden.", 502
+
+    guild = discord_bot.get_guild(int(guild_id)) if discord_bot and discord_bot.is_ready() else None
+    name = request.form.get("name", "").strip()[:100]
+    if guild is None:
+        return "Bot oder Server ist nicht bereit.", 503
+    if not name:
+        abort(400, "Bitte gib einen Rollennamen ein.")
+    if guild.me is None or not guild.me.guild_permissions.manage_roles:
+        abort(403, "Dem Bot fehlt die Berechtigung Rollen verwalten.")
+
+    try:
+        run_bot_coroutine(guild.create_role(name=name, reason="Über Nexora Dashboard erstellt"))
+    except Exception:
+        app.logger.exception("Rolle konnte nicht erstellt werden.")
+        return "Rolle konnte nicht erstellt werden. Prüfe Bot-Berechtigungen und Rollenreihenfolge.", 502
+    return redirect(url_for("guild_dashboard", guild_id=guild_id))
+
+
+@app.post("/guild/<guild_id>/channel")
+def create_channel(guild_id):
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
+    try:
+        authorize_guild(guild_id)
+    except requests.RequestException:
+        return "Die Serverberechtigung konnte nicht geprüft werden.", 502
+
+    guild = discord_bot.get_guild(int(guild_id)) if discord_bot and discord_bot.is_ready() else None
+    raw_name = request.form.get("name", "").strip().lower()
+    name = re.sub(r"[^a-z0-9_-]+", "-", raw_name).strip("-")[:100]
+    kind = request.form.get("kind", "text")
+    if guild is None:
+        return "Bot oder Server ist nicht bereit.", 503
+    if not name or kind not in {"text", "voice"}:
+        abort(400, "Ungültiger Kanalname oder Kanaltyp.")
+    if guild.me is None or not guild.me.guild_permissions.manage_channels:
+        abort(403, "Dem Bot fehlt die Berechtigung Kanäle verwalten.")
+
+    try:
+        if kind == "text":
+            run_bot_coroutine(guild.create_text_channel(name=name, reason="Über Nexora Dashboard erstellt"))
+        else:
+            run_bot_coroutine(guild.create_voice_channel(name=name, reason="Über Nexora Dashboard erstellt"))
+    except Exception:
+        app.logger.exception("Kanal konnte nicht erstellt werden.")
+        return "Kanal konnte nicht erstellt werden. Prüfe Bot-Berechtigungen.", 502
+    return redirect(url_for("guild_dashboard", guild_id=guild_id))
+
+
+@app.post("/guild/<guild_id>/panel/new")
+def create_template(guild_id):
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
+    try:
+        authorize_guild(guild_id)
+    except requests.RequestException:
+        return "Die Serverberechtigung konnte nicht geprüft werden.", 502
+
+    name = request.form.get("name", "").strip()[:80]
+    if not name:
+        abort(400, "Bitte gib einen Vorlagennamen ein.")
+
+    with sqlite3.connect(DATABASE_PATH) as db:
+        cursor = db.execute(
+            "INSERT INTO panel_templates (owner_id, guild_id, name) VALUES (?, ?, ?)",
+            (str(session["discord_id"]), str(guild_id), name),
+        )
+        template_id = cursor.lastrowid
+        db.commit()
+    return redirect(url_for("edit_template", guild_id=guild_id, template_id=template_id))
+
+
+@app.route("/guild/<guild_id>/panel/<int:template_id>", methods=["GET", "POST"])
+def edit_template(guild_id, template_id):
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
+    try:
+        authorize_guild(guild_id)
+    except requests.RequestException:
+        return "Die Serverberechtigung konnte nicht geprüft werden.", 502
+
+    template = get_template(template_id, session["discord_id"], guild_id)
+    if template is None:
+        abort(404)
+
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()[:80]
+        title = request.form.get("title", "").strip()[:256]
+        body = request.form.get("body", "").strip()[:4000]
+        color = safe_color(request.form.get("color"))
+        if not name or not body:
+            abort(400, "Name und Nachricht müssen ausgefüllt sein.")
+        with sqlite3.connect(DATABASE_PATH) as db:
+            db.execute(
+                "UPDATE panel_templates SET name=?, title=?, body=?, color=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND owner_id=? AND guild_id=?",
+                (name, title, body, color, template_id, str(session["discord_id"]), str(guild_id)),
+            )
+            db.commit()
+        return redirect(url_for("edit_template", guild_id=guild_id, template_id=template_id))
+
+    guild = discord_bot.get_guild(int(guild_id)) if discord_bot and discord_bot.is_ready() else None
+    if guild is None:
+        return "Der Bot ist noch nicht bereit oder nicht auf diesem Server.", 503
+    channels = [
+        c for c in guild.text_channels
+        if c.permissions_for(guild.me).send_messages and c.permissions_for(guild.me).embed_links
+    ]
+    options = "".join(f'<option value="{c.id}">#{esc(c.name)}</option>' for c in channels)
+    content = f"""
+    <p><a href='{url_for('guild_dashboard', guild_id=guild_id)}'>← Zurück</a></p>
+    <h1>Panel-Vorlage bearbeiten</h1>
+    <form method='post'>{csrf_input()}
+      <label>Name<input name='name' maxlength='80' value='{esc(template['name'])}' required></label>
+      <label>Titel<input name='title' maxlength='256' value='{esc(template['title'])}'></label>
+      <label>Nachricht<textarea name='body' maxlength='4000' required>{esc(template['body'])}</textarea></label>
+      <label>Farbe<input type='color' name='color' value='{safe_color(template['color'])}'></label>
+      <button>Speichern</button>
+    </form>
+    <h2>Panel senden</h2>
+    <form method='post' action='{url_for('send_panel', guild_id=guild_id, template_id=template_id)}'>{csrf_input()}
+      <label>Zielkanal<select name='channel_id' required>{options}</select></label>
+      <button>Panel senden</button>
+    </form>
+    """
+    return render_page(content)
+
+
+@app.post("/guild/<guild_id>/panel/<int:template_id>/send")
+def send_panel(guild_id, template_id):
+    login_redirect = require_login()
+    if login_redirect:
+        return login_redirect
+    try:
+        authorize_guild(guild_id)
+    except requests.RequestException:
+        return "Die Serverberechtigung konnte nicht geprüft werden.", 502
+
+    template = get_template(template_id, session["discord_id"], guild_id)
+    if template is None:
+        abort(404)
+
+    guild = discord_bot.get_guild(int(guild_id)) if discord_bot and discord_bot.is_ready() else None
+    try:
+        channel_id = int(request.form.get("channel_id", ""))
+    except ValueError:
+        abort(400, "Ungültiger Zielkanal.")
+
+    channel = guild.get_channel(channel_id) if guild else None
     if not isinstance(channel, discord.TextChannel):
-        return
+        abort(404, "Zielkanal wurde nicht gefunden.")
+
+    permissions = channel.permissions_for(guild.me)
+    if not permissions.send_messages or not permissions.embed_links:
+        abort(403, "Dem Bot fehlen Nachrichten senden oder Embeds verlinken.")
+
     embed = discord.Embed(
-        title=title,
-        description=(description or "")[:4000],
-        color=discord.Color.orange(),
-        timestamp=discord.utils.utcnow(),
+        title=template["title"] or None,
+        description=template["body"],
+        color=discord.Color(int(safe_color(template["color"])[1:], 16)),
     )
     try:
-        await channel.send(embed=embed)
-    except (discord.Forbidden, discord.HTTPException):
-        log.exception("Moderationslog konnte nicht gesendet werden.")
-
-
-async def check_target(interaction, member):
-    guild = interaction.guild
-    moderator = interaction.user
-    if guild is None or not isinstance(moderator, discord.Member):
-        return "Dieser Befehl kann nur auf einem Server verwendet werden."
-    if member.id == moderator.id:
-        return "Du kannst diese Aktion nicht gegen dich selbst verwenden."
-    if member.id == guild.owner_id:
-        return "Der Serverinhaber kann nicht moderiert werden."
-    if bot.user is not None and member.id == bot.user.id:
-        return "Der Bot kann sich nicht selbst moderieren."
-    if moderator.id != guild.owner_id and member.top_role >= moderator.top_role:
-        return "Deine höchste Rolle muss über der höchsten Rolle des Ziels liegen."
-    if guild.me is None or member.top_role >= guild.me.top_role:
-        return "Die höchste Rolle des Bots muss über der höchsten Rolle des Ziels liegen."
-    return None
-
-
-async def has_bot_permission(interaction, permission_name):
-    guild = interaction.guild
-    bot_member = guild.me if guild else None
-    if bot_member is None or not getattr(bot_member.guild_permissions, permission_name, False):
-        await interaction.response.send_message(
-            f"Dem Bot fehlt die erforderliche Berechtigung: `{permission_name}`.",
-            ephemeral=True,
-        )
-        return False
-    return True
-
-
-@bot.event
-async def setup_hook():
-    await initialize_database()
-    synced = await bot.tree.sync()
-    log.info("%s Slash-Commands synchronisiert.", len(synced))
-
-
-@bot.event
-async def on_ready():
-    log.info("Discord-Bot angemeldet als %s", bot.user)
-
-
-@bot.event
-async def on_message(message):
-    if message.guild is None or message.author.bot or not isinstance(message.author, discord.Member):
-        return
-    settings = await get_guild_settings(message.guild.id)
-    reason = None
-    if settings["links_enabled"] and LINK_PATTERN.search(message.content):
-        reason = "Link-Filter"
-    if settings["spam_enabled"]:
-        key = (message.guild.id, message.author.id)
-        timestamps = message_timestamps[key]
-        now = discord.utils.utcnow().timestamp()
-        while timestamps and now - timestamps[0] > int(settings["spam_window_seconds"]):
-            timestamps.popleft()
-        timestamps.append(now)
-        if len(timestamps) >= int(settings["spam_limit"]):
-            reason = reason or "Spam-Filter"
-            timestamps.clear()
-    if reason:
-        try:
-            await message.delete()
-            await log_moderation(
-                message.guild,
-                "Auto-Moderation",
-                f"Nachricht von {message.author.mention} in {message.channel.mention} entfernt. Regel: {reason}.",
-            )
-        except discord.Forbidden:
-            log.warning("Keine Berechtigung, eine Auto-Mod-Nachricht zu löschen.")
-        except discord.HTTPException:
-            log.exception("Auto-Mod konnte Nachricht nicht löschen.")
-    await bot.process_commands(message)
-
-
-def format_member_message(template, member):
-    return (
-        template.replace("{user}", str(member))
-        .replace("{server}", member.guild.name)
-        .replace("{member_count}", str(member.guild.member_count or 0))
-    )[:1900]
-
-
-@bot.event
-async def on_member_join(member):
-    settings = await get_guild_settings(member.guild.id)
-    channel_id = int(settings["welcome_channel_id"] or 0)
-    channel = member.guild.get_channel(channel_id) if channel_id else None
-    if isinstance(channel, discord.TextChannel):
-        try:
-            await channel.send(
-                format_member_message(settings["welcome_message"], member),
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except discord.HTTPException:
-            log.exception("Willkommensnachricht konnte nicht gesendet werden.")
-    verification_role_id = settings.get("verification_role_id")
-    if verification_role_id:
-        role = member.guild.get_role(int(verification_role_id))
-        if role is not None:
-            try:
-                await member.add_roles(role, reason="Verifizierung")
-            except discord.Forbidden:
-                pass
-    await log_moderation(member.guild, "Mitglied beigetreten", f"{member} (`{member.id}`) ist beigetreten.")
-
-
-@bot.event
-async def on_member_remove(member):
-    settings = await get_guild_settings(member.guild.id)
-    channel_id = int(settings["leave_channel_id"] or 0)
-    channel = member.guild.get_channel(channel_id) if channel_id else None
-    if isinstance(channel, discord.TextChannel):
-        try:
-            await channel.send(
-                format_member_message(settings["leave_message"], member),
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except discord.HTTPException:
-            log.exception("Abschiedsnachricht konnte nicht gesendet werden.")
-    await log_moderation(member.guild, "Mitglied ausgetreten", f"{member} (`{member.id}`) hat den Server verlassen.")
-
-
-@bot.event
-async def on_member_update(before, after):
-    before_roles = {role.id for role in before.roles}
-    after_roles = {role.id for role in after.roles}
-    if before_roles != after_roles:
-        added = [r.mention for r in after.roles if r.id not in before_roles]
-        removed = [r.mention for r in before.roles if r.id not in after_roles]
-        details = []
-        if added:
-            details.append("Hinzugefügt: " + ", ".join(added))
-        if removed:
-            details.append("Entfernt: " + ", ".join(removed))
-        await log_moderation(after.guild, "Rollen geändert", f"Mitglied: {after.mention}\n" + "\n".join(details))
-    if before.timed_out_until != after.timed_out_until:
-        status = f"bis {discord.utils.format_dt(after.timed_out_until, style='F')}" if after.timed_out_until else "aufgehoben"
-        await log_moderation(after.guild, "Timeout geändert", f"Mitglied: {after.mention}\nTimeout {status}.")
-
-
-@bot.event
-async def on_member_ban(guild, user):
-    await log_moderation(guild, "Mitglied gebannt", f"{user} (`{user.id}`) wurde gebannt.")
-
-
-@bot.event
-async def on_voice_state_update(member, before, after):
-    settings = await get_guild_settings(member.guild.id)
-    afk_channel_id = settings.get("afk_channel_id")
-    afk_role_id = settings.get("afk_role_id")
-    if not afk_channel_id or not afk_role_id:
-        return
-    afk_role = member.guild.get_role(int(afk_role_id))
-    if afk_role is None:
-        return
-    target_id = int(afk_channel_id)
-    if after.channel and after.channel.id == target_id:
-        try:
-            await member.add_roles(afk_role, reason="AFK-Rolle")
-        except discord.Forbidden:
-            pass
-    if before.channel and before.channel.id == target_id and (after.channel is None or after.channel.id != target_id):
-        try:
-            await member.remove_roles(afk_role, reason="AFK-Rolle entfernt")
-        except discord.Forbidden:
-            pass
-
-
-@bot.event
-async def on_raw_reaction_add(payload):
-    if payload.member is None or payload.member.bot:
-        return
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        rows = await db.execute(
-            "SELECT role_id FROM reaction_roles WHERE guild_id=? AND channel_id=? AND message_id=? AND emoji=?",
-            (str(payload.guild_id), str(payload.channel_id), str(payload.message_id), str(payload.emoji)),
-        )
-        row = await rows.fetchone()
-    if row is None:
-        return
-    guild = bot.get_guild(payload.guild_id)
-    if guild is None:
-        return
-    role = guild.get_role(int(row[0]))
-    if role is None:
-        return
-    try:
-        await payload.member.add_roles(role, reason="Reaktionsrolle")
-    except discord.Forbidden:
-        pass
-
-
-@bot.event
-async def on_raw_reaction_remove(payload):
-    guild = bot.get_guild(payload.guild_id)
-    if guild is None:
-        return
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        rows = await db.execute(
-            "SELECT role_id FROM reaction_roles WHERE guild_id=? AND channel_id=? AND message_id=? AND emoji=?",
-            (str(payload.guild_id), str(payload.channel_id), str(payload.message_id), str(payload.emoji)),
-        )
-        row = await rows.fetchone()
-    if row is None:
-        return
-    role = guild.get_role(int(row[0]))
-    member = guild.get_member(payload.user_id)
-    if role is not None and member is not None:
-        try:
-            await member.remove_roles(role, reason="Reaktionsrolle entfernt")
-        except discord.Forbidden:
-            pass
-
-
-@bot.tree.command(name="ticket", description="Öffnet ein Support-Ticket.")
-@app_commands.describe(grund="Grund für das Ticket")
-async def ticket(interaction: discord.Interaction, grund: str = "Kein Grund angegeben"):
-    settings = await get_guild_settings(interaction.guild_id)
-    category_id = settings.get("ticket_category_id")
-    support_role_id = settings.get("support_role_id")
-    category = interaction.guild.get_channel(int(category_id)) if category_id else None
-    if category_id and category is None:
-        await interaction.response.send_message("Die Ticket-Kategorie ist nicht mehr vorhanden.", ephemeral=True)
-        return
-    if not category_id:
-        await interaction.response.send_message("Im Dashboard wurde noch keine Ticket-Kategorie konfiguriert.", ephemeral=True)
-        return
-    name = f"ticket-{interaction.user.name.lower()}"
-    overwrites = {
-        interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
-        interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-        interaction.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True),
-    }
-    if support_role_id:
-        support_role = interaction.guild.get_role(int(support_role_id))
-        if support_role:
-            overwrites[support_role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
-    channel = await interaction.guild.create_text_channel(name=name, category=category, overwrites=overwrites, reason=f"Ticket von {interaction.user}")
-    await interaction.response.send_message(f"Ticket erstellt: {channel.mention}", ephemeral=False)
-    await channel.send(f"{interaction.user.mention} hat ein Ticket geöffnet.\nGrund: {grund}\nSupport wird informiert.")
-    if settings.get("ticket_log_channel_id"):
-        log_channel = interaction.guild.get_channel(int(settings["ticket_log_channel_id"]))
-        if isinstance(log_channel, discord.TextChannel):
-            await log_channel.send(f"Ticket erstellt: {channel.mention} von {interaction.user.mention}\nGrund: {grund}")
-
-
-@bot.tree.command(name="close_ticket", description="Schließt ein Ticket.")
-async def close_ticket(interaction: discord.Interaction):
-    if not isinstance(interaction.channel, discord.TextChannel):
-        await interaction.response.send_message("Dieser Befehl funktioniert nur in einem Textkanal.", ephemeral=True)
-        return
-    if not interaction.channel.name.startswith("ticket-"):
-        await interaction.response.send_message("Dieser Kanal ist kein Ticket.", ephemeral=True)
-        return
-    settings = await get_guild_settings(interaction.guild_id)
-    support_role_id = settings.get("support_role_id")
-    support_role = interaction.guild.get_role(int(support_role_id)) if support_role_id else None
-    is_support = bool(support_role and support_role in interaction.user.roles)
-    if interaction.user != interaction.guild.owner and not is_support and interaction.channel.permissions_for(interaction.user).manage_channels is False:
-        await interaction.response.send_message("Du darfst dieses Ticket nicht schließen.", ephemeral=True)
-        return
-    await interaction.response.send_message(f"Ticket {interaction.channel.mention} wird geschlossen.")
-    await interaction.channel.send("Das Ticket wird in 5 Sekunden geschlossen.")
-    await discord.utils.sleep_until(discord.utils.utcnow() + timedelta(seconds=5))
-    await interaction.channel.delete(reason="Ticket geschlossen")
-
-
-@bot.tree.command(name="supportping", description="Pingt das Support-Team.")
-async def supportping(interaction: discord.Interaction, text: str = "Support benötigt Hilfe!"):
-    settings = await get_guild_settings(interaction.guild_id)
-    support_role_id = settings.get("support_role_id")
-    if not support_role_id:
-        await interaction.response.send_message("Es ist noch keine Support-Rolle konfiguriert.", ephemeral=True)
-        return
-    role = interaction.guild.get_role(int(support_role_id))
-    if role is None:
-        await interaction.response.send_message("Die Support-Rolle konnte nicht gefunden werden.", ephemeral=True)
-        return
-    await interaction.response.send_message(f"{role.mention} {text}")
-
-
-@bot.tree.command(name="verify", description="Gibt die Verifizierungsrolle.")
-async def verify(interaction: discord.Interaction):
-    settings = await get_guild_settings(interaction.guild_id)
-    role_id = settings.get("verification_role_id")
-    if not role_id:
-        await interaction.response.send_message("Es ist noch keine Verifizierungsrolle konfiguriert.", ephemeral=True)
-        return
-    role = interaction.guild.get_role(int(role_id))
-    if role is None:
-        await interaction.response.send_message("Die Verifizierungsrolle konnte nicht gefunden werden.", ephemeral=True)
-        return
-    if role in interaction.user.roles:
-        await interaction.response.send_message("Du bist bereits verifiziert.", ephemeral=True)
-        return
-    await interaction.user.add_roles(role, reason="Verifiziert")
-    await interaction.response.send_message("Du bist nun verifiziert.", ephemeral=True)
-
-
-@bot.tree.command(name="timeout", description="Gibt einem Mitglied einen Timeout.")
-@app_commands.describe(mitglied="Mitglied", minuten="Dauer in Minuten, maximal 40320", grund="Grund")
-async def timeout(interaction: discord.Interaction, mitglied: discord.Member, minuten: app_commands.Range[int, 1, 40320], grund: str = "Kein Grund angegeben"):
-    if not await has_bot_permission(interaction, "moderate_members"):
-        return
-    error = await check_target(interaction, mitglied)
-    if error:
-        await interaction.response.send_message(error, ephemeral=True)
-        return
-    try:
-        await mitglied.timeout(timedelta(minutes=minuten), reason=grund)
-        await interaction.response.send_message(f"{mitglied.mention} hat einen Timeout für {minuten} Minuten erhalten. Grund: {grund}")
-        await log_moderation(interaction.guild, "Timeout", f"Mitglied: {mitglied.mention}\nModerator: {interaction.user.mention}\nDauer: {minuten} Minuten\nGrund: {grund}")
-    except discord.Forbidden:
-        await interaction.response.send_message("Discord hat die Aktion verweigert. Prüfe Bot-Berechtigungen und Rollenreihenfolge.", ephemeral=True)
-    except discord.HTTPException:
-        log.exception("Timeout fehlgeschlagen.")
-        await interaction.response.send_message("Der Timeout ist fehlgeschlagen.", ephemeral=True)
-
-
-@bot.tree.command(name="kick", description="Wirft ein Mitglied vom Server.")
-@app_commands.describe(mitglied="Mitglied, das gekickt werden soll", grund="Grund für den Kick")
-async def kick(interaction: discord.Interaction, mitglied: discord.Member, grund: str = "Kein Grund angegeben"):
-    if not await has_bot_permission(interaction, "kick_members"):
-        return
-    error = await check_target(interaction, mitglied)
-    if error:
-        await interaction.response.send_message(error, ephemeral=True)
-        return
-    try:
-        await mitglied.kick(reason=grund)
-        await interaction.response.send_message(f"{mitglied} wurde gekickt. Grund: {grund}")
-        await log_moderation(interaction.guild, "Kick", f"Mitglied: {mitglied} (`{mitglied.id}`)\nModerator: {interaction.user.mention}\nGrund: {grund}")
-    except discord.Forbidden:
-        await interaction.response.send_message("Discord hat die Aktion verweigert. Prüfe Bot-Berechtigungen und Rollenreihenfolge.", ephemeral=True)
-    except discord.HTTPException:
-        log.exception("Kick fehlgeschlagen.")
-        await interaction.response.send_message("Der Kick ist fehlgeschlagen.", ephemeral=True)
-
-
-@bot.tree.command(name="ban", description="Bannt ein Mitglied vom Server.")
-@app_commands.describe(mitglied="Mitglied, das gebannt werden soll", grund="Grund für den Ban")
-async def ban(interaction: discord.Interaction, mitglied: discord.Member, grund: str = "Kein Grund angegeben"):
-    if not await has_bot_permission(interaction, "ban_members"):
-        return
-    error = await check_target(interaction, mitglied)
-    if error:
-        await interaction.response.send_message(error, ephemeral=True)
-        return
-    try:
-        await mitglied.ban(reason=grund)
-        await interaction.response.send_message(f"{mitglied} wurde gebannt. Grund: {grund}")
-        await log_moderation(interaction.guild, "Ban", f"Mitglied: {mitglied} (`{mitglied.id}`)\nModerator: {interaction.user.mention}\nGrund: {grund}")
-    except discord.Forbidden:
-        await interaction.response.send_message("Discord hat die Aktion verweigert. Prüfe Bot-Berechtigungen und Rollenreihenfolge.", ephemeral=True)
-    except discord.HTTPException:
-        log.exception("Ban fehlgeschlagen.")
-        await interaction.response.send_message("Der Ban ist fehlgeschlagen.", ephemeral=True)
-
-
-@bot.tree.command(name="warn", description="Vermerkt eine Verwarnung für ein Mitglied.")
-@app_commands.describe(mitglied="Mitglied, das verwarnt werden soll", grund="Grund für die Verwarnung")
-async def warn(interaction: discord.Interaction, mitglied: discord.Member, grund: str):
-    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.moderate_members:
-        await interaction.response.send_message("Du benötigst die Berechtigung Mitglieder moderieren.", ephemeral=True)
-        return
-    error = await check_target(interaction, mitglied)
-    if error:
-        await interaction.response.send_message(error, ephemeral=True)
-        return
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute(
-            "INSERT INTO warnings (guild_id, user_id, moderator_id, reason, created_at) VALUES (?, ?, ?, ?, ?)",
-            (interaction.guild_id, mitglied.id, interaction.user.id, grund, discord.utils.utcnow().isoformat()),
-        )
-        await db.commit()
-        warning_id = cursor.lastrowid
-    try:
-        await mitglied.send(f"Du wurdest auf **{interaction.guild.name}** verwarnt.\nGrund: {grund}\nVerwarnungs-ID: `{warning_id}`")
-    except (discord.Forbidden, discord.HTTPException):
-        pass
-    await interaction.response.send_message(f"{mitglied.mention} wurde verwarnt. Verwarnungs-ID: `{warning_id}`. Grund: {grund}")
-    await log_moderation(interaction.guild, "Verwarnung", f"Mitglied: {mitglied.mention}\nModerator: {interaction.user.mention}\nID: `{warning_id}`\nGrund: {grund}")
-
-
-@bot.tree.command(name="warnungen", description="Zeigt die letzten zehn Verwarnungen eines Mitglieds.")
-@app_commands.describe(mitglied="Mitglied, dessen Verwarnungen angezeigt werden")
-async def warnungen(interaction: discord.Interaction, mitglied: discord.Member):
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute(
-            "SELECT id, moderator_id, reason, created_at FROM warnings WHERE guild_id=? AND user_id=? ORDER BY id DESC LIMIT 10",
-            (interaction.guild_id, mitglied.id),
-        )
-        rows = await cursor.fetchall()
-    if not rows:
-        await interaction.response.send_message(f"Für {mitglied.mention} wurden keine Verwarnungen gefunden.", ephemeral=True)
-        return
-    lines = [f"`#{row[0]}` — {row[2]} (Moderator: <@{row[1]}>, {row[3][:10]})" for row in rows]
-    await interaction.response.send_message(f"Letzte Verwarnungen für {mitglied.mention}:\n" + "\n".join(lines), ephemeral=True)
-
-
-@bot.tree.command(name="warnung_loeschen", description="Löscht eine Verwarnung anhand ihrer ID.")
-@app_commands.describe(warnungs_id="ID der zu löschenden Verwarnung")
-async def warnung_loeschen(interaction: discord.Interaction, warnungs_id: int):
-    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.moderate_members:
-        await interaction.response.send_message("Du benötigst die Berechtigung Mitglieder moderieren.", ephemeral=True)
-        return
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute("DELETE FROM warnings WHERE id=? AND guild_id=?", (warnungs_id, interaction.guild_id))
-        await db.commit()
-        deleted = cursor.rowcount
-    if not deleted:
-        await interaction.response.send_message("Diese Verwarnungs-ID wurde auf diesem Server nicht gefunden.", ephemeral=True)
-        return
-    await interaction.response.send_message(f"Verwarnung `{warnungs_id}` wurde gelöscht.")
-    await log_moderation(interaction.guild, "Verwarnung gelöscht", f"Verwarnungs-ID: `{warnungs_id}`\nModerator: {interaction.user.mention}")
-
-
-def run_dashboard():
-    port = int(os.getenv("SERVER_PORT", "5000"))
-    log.info("Flask-Dashboard startet auf 0.0.0.0:%s", port)
-    app.run(host="0.0.0.0", port=port, use_reloader=False)
+        run_bot_coroutine(channel.send(embed=embed))
+    except Exception:
+        app.logger.exception("Panel konnte nicht gesendet werden.")
+        return "Panel konnte nicht gesendet werden. Prüfe Bot-Berechtigungen.", 502
+    return redirect(url_for("guild_dashboard", guild_id=guild_id))
 
 
 if __name__ == "__main__":
-    Thread(target=run_dashboard, daemon=True).start()
-    bot.run(TOKEN)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    app.run(host="0.0.0.0", port=5000, debug=False)
